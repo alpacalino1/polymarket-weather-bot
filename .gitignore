@@ -1,0 +1,29 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+dist/
+
+# Environment & secrets
+.env
+*.key
+*.pem
+credentials.json
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+bot.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data
+data/
