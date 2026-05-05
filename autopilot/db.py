@@ -360,8 +360,8 @@ class AutopilotDB:
             "realized_pnl": round(today_trades["pnl"] or 0, 2),
             "starting_capital": self.starting_capital,
             "ending_capital": portfolio["total_value"],
-            "win_rate": (round(today_trades["wins"] / 
-                         ((today_trades["wins"] + today_trades["losses"]) or 1) * 100, 1)),
+            "win_rate": (round((today_trades["wins"] or 0) / 
+                         (((today_trades["wins"] or 0) + (today_trades["losses"] or 0)) or 1) * 100, 1)),
             "best_strategy": best["strategy"] if best else "",
             "best_strategy_pnl": round(best["spnl"], 2) if best else 0,
         }

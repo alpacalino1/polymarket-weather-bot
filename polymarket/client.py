@@ -195,21 +195,54 @@ class GammaClient:
         outcome_prices_raw = raw.get("outcomePrices", [])
 
         # Map outcomes to their token IDs
+        # outcomes_raw may be a JSON string like '["Yes","No"]' or a list
         outcomes = []
+        if isinstance(outcomes_raw, str):
+            import json as _json
+            try:
+                outcomes = _json.loads(outcomes_raw)
+            except (_json.JSONDecodeError, TypeError):
+                outcomes = [outcomes_raw]
+        elif isinstance(outcomes_raw, list):
+            outcomes = [str(o) for o in outcomes_raw]
+
         token_ids = {}
-        for tok_str in outcomes_raw:
-            outcomes.append(tok_str)
         for tok in tokens_raw:
             outcome = tok.get("outcome", "")
             token_id = tok.get("token_id", "")
             if outcome and token_id:
                 token_ids[outcome] = token_id
 
-        # Map outcome prices
+        # Fallback: derive token IDs from clobTokenIds + outcomes
+        if not token_ids and clob_ids and len(clob_ids) >= len(outcomes):
+            for i, outcome in enumerate(outcomes):
+                if i < len(clob_ids):
+                    token_ids[outcome] = clob_ids[i]
+
+        # Map outcome prices (handle JSON string or list of dicts)
         outcome_prices = {}
-        for op in outcome_prices_raw:
-            if isinstance(op, dict):
-                outcome_prices[op.get("outcome", "")] = float(op.get("price", 0))
+        if isinstance(outcome_prices_raw, str):
+            import json as _json
+            try:
+                parsed = _json.loads(outcome_prices_raw)
+                if isinstance(parsed, list):
+                    for op in parsed:
+                        if isinstance(op, dict):
+                            outcome_prices[op.get("outcome", "")] = float(op.get("price", 0))
+            except (_json.JSONDecodeError, TypeError):
+                pass
+        elif isinstance(outcome_prices_raw, list):
+            for op in outcome_prices_raw:
+                if isinstance(op, dict):
+                    outcome_prices[op.get("outcome", "")] = float(op.get("price", 0))
+
+        # Last resort: use token prices from tokens array
+        if not outcome_prices and tokens_raw:
+            for tok in tokens_raw:
+                price = tok.get("price")
+                outcome = tok.get("outcome", "")
+                if price is not None and outcome:
+                    outcome_prices[outcome] = float(price)
 
         # Parse end date
         end_date = None
