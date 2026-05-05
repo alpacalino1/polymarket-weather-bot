@@ -216,30 +216,143 @@ class DemoAutopilot:
 
         console.print()
 
-        # ── PHASE 3: Evaluate strategies and show decisions ─────────────
+        # ── PHASE 2.5: Manage existing positions (exits) ─────────────
+        existing_trades = self.db.get_open_trades()
+        trades_closed = 0
+        pnl_from_exits = 0.0
+        closed_condition_ids: set[str] = set()
+
+        if existing_trades:
+            console.print(f"[bold]🔒 PHASE 2.5: Managing {len(existing_trades)} existing positions...[/bold]\n")
+            for trade in existing_trades:
+                # Re-evaluate with fresh forecast
+                parsed = parse_weather_market(trade["market_question"], trade["condition_id"])
+                if not parsed.city:
+                    continue
+
+                loc = await self.weather.geocode_first(parsed.city, parsed.state)
+                if not loc:
+                    continue
+
+                target = parsed.target_date or (date.today() + timedelta(days=7))
+                days_out = (target - date.today()).days
+                if days_out < 0:
+                    # Event passed! Close at outcome
+                    exit_price = 1.0 if trade["outcome"] == "Yes" else 0.0
+                    result = self.db.close_trade(trade["id"], exit_price, "Event date passed")
+                    refund = trade["cost_basis"] + result["pnl"]
+                    self.db.add_cash(refund)
+                    closed_condition_ids.add(trade["condition_id"])
+                    pnl_sign = "+" if result["pnl"] >= 0 else ""
+                    console.print(
+                        f"  🔒 #{trade['id']}: {pnl_sign}${result['pnl']:.2f} | "
+                        f"\"{trade['market_question'][:60]}...\" | ⏰ Event date passed"
+                    )
+                    trades_closed += 1
+                    pnl_from_exits += result["pnl"]
+                    continue
+
+                actual_days = min(max(days_out + 3, 3), 16)
+                fc = await self.weather.get_forecast(loc.latitude, loc.longitude, actual_days)
+
+                target_fc = None
+                for df in fc.daily:
+                    if df.date == target:
+                        target_fc = df
+                        break
+                if not target_fc and fc.daily:
+                    target_fc = fc.daily[min(days_out, len(fc.daily)-1)]
+
+                if not target_fc:
+                    continue
+
+                # Recalculate edge
+                yes_price = float(trade["entry_price"])
+                if parsed.metric == "temperature" and parsed.temp_threshold_c is not None:
+                    above = parsed.temp_direction != "below"
+                    current_prob = self.weather.temperature_probability(
+                        target_fc, parsed.temp_threshold_c, above
+                    )
+                elif parsed.metric in ("precipitation", "snowfall"):
+                    current_prob = self.weather.precipitation_probability(target_fc)
+                else:
+                    current_prob = 0.5
+
+                if trade["outcome"] == "Yes":
+                    current_edge = current_prob - yes_price
+                else:
+                    current_edge = (1 - current_prob) - (1 - yes_price)
+
+                abs_edge = abs(current_edge)
+
+                # Exit conditions
+                should_close = False
+                reason = ""
+                exit_price = yes_price
+
+                if abs_edge < 0.02:
+                    should_close = True
+                    reason = f"Edge decayed ({abs_edge:.1%})"
+                elif trade["outcome"] == "Yes" and current_prob > 0.95:
+                    should_close = True
+                    reason = f"High conviction ({current_prob:.1%}) - take profit"
+                    exit_price = current_prob
+                elif trade["outcome"] == "No" and current_prob < 0.05:
+                    should_close = True
+                    reason = f"High conviction NO ({current_prob:.1%}) - take profit"
+                    exit_price = 1 - current_prob
+
+                if should_close:
+                    result = self.db.close_trade(trade["id"], exit_price, reason)
+                    refund = trade["cost_basis"] + result["pnl"]
+                    self.db.add_cash(refund)
+                    closed_condition_ids.add(trade["condition_id"])
+                    pnl_sign = "+" if result["pnl"] >= 0 else ""
+                    console.print(
+                        f"  🔒 #{trade['id']}: {pnl_sign}${result['pnl']:.2f} | "
+                        f"entry {trade['entry_price']:.3f} → exit {exit_price:.3f} | "
+                        f"\"{trade['market_question'][:50]}...\" | {reason}"
+                    )
+                    trades_closed += 1
+                    pnl_from_exits += result["pnl"]
+                else:
+                    console.print(
+                        f"  🔓 #{trade['id']}: HOLD | edge={abs_edge:.1%} | "
+                        f"\"{trade['market_question'][:50]}...\""
+                    )
+
+            if trades_closed:
+                console.print(f"\n  [bold green]{trades_closed} positions closed | P&L: ${pnl_from_exits:+,.2f}[/bold green]")
+            console.print()
+
+        # ── PHASE 3: Evaluate new entries ──────────────────────────────
+        open_condition_ids = {t["condition_id"] for t in self.db.get_open_trades()}
+        skip_ids = open_condition_ids | closed_condition_ids
+
         console.print("[bold]🧠 PHASE 3: Strategy evaluation & trade decisions...[/bold]\n")
 
-        signals_table = Table(
-            show_header=True, header_style="bold white", border_style="green"
-        )
+        signals_table = Table(show_header=True, header_style="bold white", border_style="green")
         signals_table.add_column("#", style="dim", width=3)
-        signals_table.add_column("Market", width=30)
-        signals_table.add_column("Model Prob", justify="right", style="cyan")
-        signals_table.add_column("Market Price", justify="right")
-        signals_table.add_column("Edge", justify="right", style="bold magenta")
-        signals_table.add_column("Action", justify="center", style="bold")
-        signals_table.add_column("Size", justify="right", style="blue")
-        signals_table.add_column("Reason", width=40)
+        signals_table.add_column("City", width=12)
+        signals_table.add_column("Forecast", width=14)
+        signals_table.add_column("Model %", justify="right", style="cyan", width=8)
+        signals_table.add_column("Market %", justify="right", width=8)
+        signals_table.add_column("Edge", justify="right", style="bold magenta", width=8)
+        signals_table.add_column("Action", justify="center", style="bold", width=12)
+        signals_table.add_column("Size", justify="right", style="blue", width=6)
+        signals_table.add_column("Reason", width=38)
 
         trades_opened = 0
         for i, market in enumerate(markets, 1):
             if market.condition_id not in forecasts:
                 continue
+            if market.condition_id in skip_ids:
+                signals_table.add_row(str(i), "-", "-", "-", "-", "-", "[dim]HELD/SKIPPED[/dim]", "-", "Already managed this cycle")
+                continue
 
             parsed, fc = forecasts[market.condition_id]
             yes_price = market.outcome_prices.get("Yes", 0.5)
 
-            # Try temp strategy
             signal = None
             for strat in strategies:
                 try:
@@ -256,7 +369,6 @@ class DemoAutopilot:
                     continue
 
             if signal:
-                # Record paper trade
                 self.db.deduct_cash(signal.size_usdc)
                 tid = self.db.open_trade(
                     condition_id=signal.condition_id,
@@ -269,31 +381,41 @@ class DemoAutopilot:
                 )
                 trades_opened += 1
 
-                action = ("[bold green]BUY YES[/bold green]" 
-                         if signal.outcome == "Yes" 
-                         else "[bold red]BUY NO[/bold red]")
-                short_reason = signal.explanation.split("Threshold:")[0].strip()[:40]
+                action_color = "green" if signal.outcome == "Yes" else "red"
+                action = f"[bold {action_color}]BUY {signal.outcome.upper()}[/bold {action_color}]"
+
+                # Show key forecast info
+                target_fc = None
+                for df in fc.daily:
+                    if df.date == parsed.target_date:
+                        target_fc = df
+                        break
+                if target_fc:
+                    fcast = f"{(target_fc.temp_max*9/5+32):.0f}°F"
+                else:
+                    fcast = "?"
 
                 signals_table.add_row(
-                    str(i),
-                    parsed.city or "?",
+                    str(i), parsed.city[:12], fcast,
                     f"{signal.model_probability:.1%}",
                     f"{signal.market_price:.1%}",
                     f"{signal.edge:.1%}",
                     action,
                     f"${signal.size_usdc:.0f}",
-                    short_reason,
+                    signal.explanation.split("Threshold:")[0][:38],
                 )
             else:
+                target_fc = None
+                for df in fc.daily:
+                    if df.date == parsed.target_date:
+                        target_fc = df
+                        break
+                fcast = f"{(target_fc.temp_max*9/5+32):.0f}°F" if target_fc else "?"
+
                 signals_table.add_row(
-                    str(i),
-                    parsed.city or "?",
-                    f"{0.5:.0%}",
-                    f"{yes_price:.0%}",
-                    f"{0.0:.1%}",
-                    "[dim]SKIP[/dim]",
-                    "$0",
-                    "Edge below threshold",
+                    str(i), parsed.city[:12], fcast,
+                    f"{0.5:.0%}", f"{yes_price:.0%}", "-",
+                    "[dim]SKIP[/dim]", "-", "No edge"
                 )
 
         console.print(signals_table)
@@ -302,54 +424,64 @@ class DemoAutopilot:
         self.db.snapshot_portfolio()
         self.db.record_daily_stats()
         portfolio = self.db.get_portfolio_state()
-        stats = self.db.get_all_time_stats()
 
         console.print()
         console.print(Panel(
-            f"📊 Portfolio Value: ${portfolio['total_value']:,.2f} | "
-            f"Cash: ${portfolio['cash']:,.2f} | "
-            f"Invested: ${portfolio['invested']:,.2f} | "
-            f"Open: {portfolio['open_positions']} pos | "
-            f"Trades: {trades_opened} this cycle",
+            f"💰 Portfolio Value: ${portfolio['total_value']:,.2f}  │  "
+            f"Cash: ${portfolio['cash']:,.2f}  │  "
+            f"Invested: ${portfolio['invested']:,.2f}  │  "
+            f"Return: {portfolio['total_return_pct']:+.1f}%",
             title="🏦 Portfolio",
             border_style="yellow"
         ))
 
-        # Show open trades
+        # Show open trades compact
         open_trades = self.db.get_open_trades()
         if open_trades:
-            console.print("[bold]🔓 Open Positions:[/bold]")
+            console.print(f"\n[bold]🔓 {len(open_trades)} Open Positions:[/bold]")
+            ot = Table(show_header=True, header_style="bold", border_style="dim blue")
+            ot.add_column("ID", style="dim", width=4)
+            ot.add_column("City", width=10)
+            ot.add_column("Bet", width=18)
+            ot.add_column("Entry", justify="right", width=6)
+            ot.add_column("Cost", justify="right", width=6)
             for t in open_trades:
-                q = (t["market_question"] or "?")[:80]
-                console.print(
-                    f"  #{t['id']} | {t['strategy']} | {t['side']} {t['outcome']} "
-                    f"@ {t['entry_price']:.3f} | ${t['cost_basis']:.0f} | {q}"
+                parsed = parse_weather_market(t["market_question"], t["condition_id"])
+                ot.add_row(
+                    f"#{t['id']}",
+                    parsed.city[:10],
+                    f"{t['outcome']} {t['entry_price']:.2f}",
+                    f"{t['entry_price']:.3f}",
+                    f"${t['cost_basis']:.0f}",
                 )
+            console.print(ot)
 
-        # ── PHASE 5: Strategy breakdown ────────────────────────────────
+        # Show recently closed this cycle
+        if trades_closed:
+            console.print(f"\n[bold]🔒 {trades_closed} Closed This Cycle:[/bold]")
+            console.print(f"   P&L: ${pnl_from_exits:+,.2f}")
+
+        # Strategy breakdown
         breakdown = self.db.get_strategy_breakdown()
         if breakdown:
-            console.print()
-            console.print("[bold]🎯 Strategy Performance:[/bold]")
+            console.print("\n[bold]🎯 Strategy Performance (All-Time):[/bold]")
             for s in breakdown:
                 console.print(
-                    f"  {s['strategy']}: {s['trades']} trades, "
-                    f"W:{s['wins']} L:{s['losses']}, "
+                    f"   {s['strategy']}: {s['trades']} trades │ "
+                    f"W:{s['wins']} L:{s['losses']} │ "
                     f"P&L: ${s['total_pnl']:+,.2f}"
                 )
 
-        # Cleanup
+        console.print()
+        console.print(Panel(
+            "✅ Run [bold]python demo.py[/bold] again — the bot will re-evaluate\n"
+            "open positions with fresh weather data and close when edges decay!",
+            style="bold green"
+        ))
+
         await self.weather.close()
         await self.radar.close()
         self.db.close()
-
-        console.print()
-        console.print(Panel(
-            "✅ Demo complete! The bot evaluated real weather data,\n"
-            "found mispriced markets, and opened paper positions.\n\n"
-            f"Run again to see it manage exits: [bold]python demo.py[/bold]",
-            style="bold green"
-        ))
 
 
 if __name__ == "__main__":
