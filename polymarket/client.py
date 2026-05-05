@@ -188,55 +188,52 @@ class GammaClient:
         return prices
 
     def _parse_market(self, raw: dict) -> PolymarketMarket:
-        """Parse a raw market dict into our model."""
-        clob_ids = raw.get("clobTokenIds", [])
-        tokens_raw = raw.get("tokens", [])
-        outcomes_raw = raw.get("outcomes", [])
-        outcome_prices_raw = raw.get("outcomePrices", [])
+        """Parse a raw market dict from Gamma API into our model."""
+        import json as _json
 
-        # Map outcomes to their token IDs
-        # outcomes_raw may be a JSON string like '["Yes","No"]' or a list
-        outcomes = []
-        if isinstance(outcomes_raw, str):
-            import json as _json
-            try:
-                outcomes = _json.loads(outcomes_raw)
-            except (_json.JSONDecodeError, TypeError):
-                outcomes = [outcomes_raw]
-        elif isinstance(outcomes_raw, list):
-            outcomes = [str(o) for o in outcomes_raw]
+        # Helper: parse JSON string or return as-is
+        def _parse_json(val):
+            if isinstance(val, str):
+                try:
+                    return _json.loads(val)
+                except (_json.JSONDecodeError, TypeError):
+                    return val
+            return val
+
+        # Outcomes: JSON string '["Yes", "No"]' → list
+        outcomes = _parse_json(raw.get("outcomes", []))
+        if not isinstance(outcomes, list):
+            outcomes = [str(outcomes)]
+
+        # Outcome prices: JSON string '["0.555", "0.445"]' → map by index
+        prices_raw = _parse_json(raw.get("outcomePrices", []))
+        outcome_prices = {}
+        if isinstance(prices_raw, list) and outcomes:
+            for i, outcome in enumerate(outcomes):
+                if i < len(prices_raw):
+                    outcome_prices[outcome] = float(prices_raw[i])
+
+        # CLOB token IDs: JSON string → map by index
+        clob_ids = _parse_json(raw.get("clobTokenIds", []))
+        if not isinstance(clob_ids, list):
+            clob_ids = []
 
         token_ids = {}
-        for tok in tokens_raw:
-            outcome = tok.get("outcome", "")
-            token_id = tok.get("token_id", "")
-            if outcome and token_id:
-                token_ids[outcome] = token_id
-
-        # Fallback: derive token IDs from clobTokenIds + outcomes
-        if not token_ids and clob_ids and len(clob_ids) >= len(outcomes):
+        if clob_ids and outcomes and len(clob_ids) >= len(outcomes):
             for i, outcome in enumerate(outcomes):
                 if i < len(clob_ids):
-                    token_ids[outcome] = clob_ids[i]
+                    token_ids[outcome] = str(clob_ids[i])
 
-        # Map outcome prices (handle JSON string or list of dicts)
-        outcome_prices = {}
-        if isinstance(outcome_prices_raw, str):
-            import json as _json
-            try:
-                parsed = _json.loads(outcome_prices_raw)
-                if isinstance(parsed, list):
-                    for op in parsed:
-                        if isinstance(op, dict):
-                            outcome_prices[op.get("outcome", "")] = float(op.get("price", 0))
-            except (_json.JSONDecodeError, TypeError):
-                pass
-        elif isinstance(outcome_prices_raw, list):
-            for op in outcome_prices_raw:
-                if isinstance(op, dict):
-                    outcome_prices[op.get("outcome", "")] = float(op.get("price", 0))
+        # Also try tokens array (some API versions)
+        tokens_raw = raw.get("tokens") or []
+        if tokens_raw and not token_ids:
+            for tok in tokens_raw:
+                outcome = tok.get("outcome", "")
+                token_id = tok.get("token_id", "")
+                if outcome and token_id:
+                    token_ids[outcome] = str(token_id)
 
-        # Last resort: use token prices from tokens array
+        # Also try tokens prices
         if not outcome_prices and tokens_raw:
             for tok in tokens_raw:
                 price = tok.get("price")
