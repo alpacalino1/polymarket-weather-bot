@@ -24,6 +24,9 @@ Usage:
     # Paper trade (simulate trades, log results)
     python main.py --mode paper
 
+    # Autopilot (full paper trading with portfolio tracking, SQLite DB, exit logic)
+    python main.py --mode autopilot
+
     # Live trading
     python main.py --mode live
 
@@ -67,6 +70,7 @@ from polymarket import (
     parse_weather_market,
 )
 from strategies import TemperatureStrategy, PrecipitationStrategy, TradeSignal
+from autopilot import AutopilotDB, AutopilotRunner
 from utils import setup_logging, get_logger
 
 console = Console()
@@ -435,9 +439,9 @@ class WeatherTradingBot:
 @click.command(context_settings=dict(help_option_names=["-h", "--help"]))
 @click.option(
     "--mode", "-m",
-    type=click.Choice(["scan", "paper", "live"]),
+    type=click.Choice(["scan", "paper", "live", "autopilot"]),
     default=None,
-    help="Bot mode: scan (find opportunities), paper (simulate), live (real trades)"
+    help="Bot mode: scan (find opportunities), paper (simulate), live (real trades), autopilot (paper + portfolio tracking + exit logic)"
 )
 @click.option(
     "--once", "-1",
@@ -469,12 +473,18 @@ class WeatherTradingBot:
     help="Focus on specific cities (can repeat: -c 'New York' -c 'Chicago')"
 )
 @click.option(
+    "--starting-capital",
+    type=float,
+    default=None,
+    help="Starting paper capital for autopilot (default: $10,000)"
+)
+@click.option(
     "--log-level",
     type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]),
     default=None,
     help="Log level"
 )
-def main(mode, once, interval, max_position, min_edge, cities, log_level):
+def main(mode, once, interval, max_position, min_edge, cities, starting_capital, log_level):
     """🌤️  Polymarket Weather Trading Bot
 
     Discovers weather-related prediction markets on Polymarket,
@@ -504,6 +514,11 @@ def main(mode, once, interval, max_position, min_edge, cities, log_level):
         sys.exit(1)
 
     # Run the bot
+    if mode == "autopilot" or config.trading.bot_mode == "autopilot":
+        # Autopilot mode uses its own runner
+        asyncio.run(_run_autopilot(config, once, interval, max_position, min_edge, cities, starting_capital, log_level))
+        return
+
     bot = WeatherTradingBot(config)
 
     async def run():
@@ -524,6 +539,154 @@ def main(mode, once, interval, max_position, min_edge, cities, log_level):
             await bot.shutdown()
 
     asyncio.run(run())
+
+
+async def _run_autopilot(
+    cfg: AppConfig,
+    once: bool,
+    interval: int | None,
+    max_position: float | None,
+    min_edge: float | None,
+    cities: list[str] | None,
+    starting_capital: float | None,
+    log_level: str | None,
+):
+    """Run the autopilot - full paper trading with portfolio tracking."""
+    cap = starting_capital or 10_000
+    max_pos = max_position or cfg.trading.max_position_usdc
+    edge = min_edge if min_edge is not None else cfg.trading.min_edge
+    scan_interval = interval or cfg.trading.scan_interval_minutes
+    log_lvl = log_level or cfg.log_level
+
+    logger = setup_logging(level=log_lvl, log_file="autopilot.log")
+    logger.info(f"🤖 Autopilot starting with ${cap:,.0f} paper capital")
+    logger.info(f"   Max position: ${max_pos:.0f} | Min edge: {edge:.1%} | Interval: {scan_interval}min")
+
+    # Init components
+    db = AutopilotDB(starting_capital=cap)
+    weather = OpenMeteoClient()
+    radar = RainViewerClient()
+    gamma = GammaClient(cfg.polymarket.gamma_url)
+
+    # Init strategies
+    strategies = [
+        TemperatureStrategy(weather),
+        PrecipitationStrategy(weather),
+    ]
+
+    # Apply city filter
+    if cities:
+        cfg.focus_locations = list(cities)
+
+    runner = AutopilotRunner(
+        db=db,
+        gamma=gamma,
+        weather=weather,
+        radar=radar,
+        strategies=strategies,
+        max_position=max_pos,
+        min_edge=edge,
+        cooldown_minutes=30,
+    )
+
+    try:
+        if once:
+            results = await runner.run_cycle()
+            console.print()
+            console.print(Panel(
+                Text("🤖 Autopilot Cycle Complete", style="bold magenta"),
+                subtitle=f"{results['cycle_time_seconds']}s"
+            ))
+            console.print(f"📊 Scanned: {results['markets_scanned']} | "
+                          f"Evaluated: {results['markets_evaluated']} | "
+                          f"Signals: {results['signals_found']}")
+            console.print(f"📝 Opened: {results['trades_opened']} | "
+                          f"Closed: {results['trades_closed']} | "
+                          f"P&L: ${results['pnl_change']:+.2f}")
+
+            # Print summary
+            summary = runner.generate_summary()
+            console.print()
+            console.print(Panel(summary, title="📋 Autopilot Report", border_style="blue"))
+
+            # Print open trades in a table
+            open_trades = db.get_open_trades()
+            if open_trades:
+                table = Table(title="🔓 Open Paper Positions", border_style="yellow")
+                table.add_column("ID", style="dim")
+                table.add_column("Strategy")
+                table.add_column("Outcome")
+                table.add_column("Entry", justify="right")
+                table.add_column("Cost", justify="right")
+                table.add_column("Market")
+                for t in open_trades:
+                    table.add_row(
+                        f"#{t['id']}",
+                        t["strategy"],
+                        t["outcome"],
+                        f"{t['entry_price']:.3f}",
+                        f"${t['cost_basis']:.0f}",
+                        (t["market_question"] or "")[:50],
+                    )
+                console.print(table)
+
+            # Print all-time stats
+            stats = db.get_all_time_stats()
+            if stats["total_trades"] > 0:
+                console.print()
+                console.print(Panel(
+                    f"📈 All-time: {stats['total_trades']} trades | "
+                    f"Win rate: {stats['win_rate']:.1f}% | "
+                    f"P&L: ${stats['total_pnl']:+,.2f} | "
+                    f"Avg win: ${stats['avg_win']:+,.2f} | "
+                    f"Avg loss: ${stats['avg_loss']:+,.2f}",
+                    title="Performance Stats",
+                    border_style="green",
+                ))
+        else:
+            # Continuous mode
+            console.print(Panel(
+                f"🤖 Autopilot running every {scan_interval} min with ${cap:,.0f} paper capital\n"
+                f"   Press Ctrl+C to stop",
+                style="bold magenta"
+            ))
+
+            while True:
+                try:
+                    results = await runner.run_cycle()
+                    portfolio = db.get_portfolio_state()
+                    console.print(
+                        f"[dim]{datetime.now().strftime('%H:%M:%S')}[/dim] "
+                        f"Cycle: scanned={results['markets_scanned']} "
+                        f"traded={results['trades_opened']} "
+                        f"closed={results['trades_closed']} "
+                        f"P&L=${results['pnl_change']:+.2f} | "
+                        f"Portfolio: ${portfolio['total_value']:,.0f} "
+                        f"({portfolio['total_return_pct']:+.1f}%) | "
+                        f"Open: {portfolio['open_positions']}"
+                    )
+
+                    if results["markets_scanned"] > 0:
+                        summary = runner.generate_summary()
+                        # Save summary to file
+                        summary_path = Path(cfg.data_dir) / "latest_summary.md"
+                        summary_path.write_text(summary)
+                except Exception as e:
+                    logger.error(f"Autopilot cycle error: {e}", exc_info=True)
+
+                await asyncio.sleep(scan_interval * 60)
+    except KeyboardInterrupt:
+        console.print("\n[bold yellow]🛑 Autopilot shutting down...[/bold yellow]")
+    finally:
+        db.record_daily_stats()
+        summary = runner.generate_summary()
+        summary_path = Path(cfg.data_dir) / "final_summary.md"
+        summary_path.write_text(summary)
+        console.print(f"\n[green]📄 Final summary saved to {summary_path}[/green]")
+        await weather.close()
+        await radar.close()
+        await gamma.close()
+        db.close()
 
 
 if __name__ == "__main__":
