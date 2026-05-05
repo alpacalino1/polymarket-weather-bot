@@ -222,12 +222,12 @@ def build_dashboard(data: dict, cycle: int, elapsed: float) -> Layout:
         ]
         for d in day_targets:
             prob = barrier_probability(spot, target, d, sigma)
-            if prob > 0.10:
-                row.append(f"[bold green]{prob*100:.1f}%[/bold green]")
+            if prob > 0.80:
+                row.append(f"[bold white on dark_green] {prob*100:.0f}% [/bold white on dark_green]")
+            elif prob > 0.60:
+                row.append(f"[bold green]{prob*100:.0f}%[/bold green]")
             elif prob > 0.01:
-                row.append(f"[green]{prob*100:.1f}%[/green]")
-            elif prob > 0.001:
-                row.append(f"[dim green]{prob*100:.2f}%[/dim green]")
+                row.append(f"{prob*100:.1f}%")
             else:
                 row.append(f"[dim]{prob*100:.2f}%[/dim]")
         btable.add_row(*row)
@@ -243,12 +243,12 @@ def build_dashboard(data: dict, cycle: int, elapsed: float) -> Layout:
         ]
         for d in day_targets:
             prob = barrier_probability(spot, target, d, sigma)
-            if prob > 0.25:
-                row.append(f"[bold red]{prob*100:.1f}%[/bold red]")
-            elif prob > 0.10:
-                row.append(f"[red]{prob*100:.1f}%[/red]")
+            if prob > 0.80:
+                row.append(f"[bold white on dark_red] {prob*100:.0f}% [/bold white on dark_red]")
+            elif prob > 0.60:
+                row.append(f"[bold red]{prob*100:.0f}%[/bold red]")
             elif prob > 0.01:
-                row.append(f"[dim red]{prob*100:.1f}%[/dim red]")
+                row.append(f"{prob*100:.1f}%")
             else:
                 row.append(f"[dim]{prob*100:.2f}%[/dim]")
         btable.add_row(*row)
@@ -298,6 +298,35 @@ def build_dashboard(data: dict, cycle: int, elapsed: float) -> Layout:
     prob_2sigma = barrier_probability(spot, spot * (1 + 2 * range_30d / 100), 30, sigma)
     right_lines.append(f"")
     right_lines.append(f"  2σ event in 30d: {prob_2sigma*100:.1f}%")
+
+    # ── Trade signals ──────────────────────────────────────────
+    signals_long = []
+    signals_short = []
+    for pct in [5, 10, 15, 20]:
+        for d in [3, 7, 14, 30]:
+            # Upside
+            prob_up = barrier_probability(spot, spot * (1 + pct / 100), d, sigma)
+            if prob_up > 0.60:
+                signals_long.append((pct, d, prob_up))
+            # Downside
+            prob_dn = barrier_probability(spot, spot * (1 - pct / 100), d, sigma)
+            if prob_dn > 0.60:
+                signals_short.append((pct, d, prob_dn))
+
+    if signals_long or signals_short:
+        right_lines += ["", "[bold]🎯 Signals (>60% prob)[/bold]", ""]
+        for pct, d, prob in signals_long[:5]:
+            target = spot * (1 + pct / 100)
+            right_lines.append(
+                f"  [bold green]LONG[/bold green] +{pct}% in {d}d "
+                f"({prob*100:.0f}%) → ${target:,.0f}"
+            )
+        for pct, d, prob in signals_short[:5]:
+            target = spot * (1 - pct / 100)
+            right_lines.append(
+                f"  [bold red]SHORT[/bold red] -{pct}% in {d}d "
+                f"({prob*100:.0f}%) → ${target:,.0f}"
+            )
 
     right_lines += [
         "",
@@ -367,7 +396,14 @@ async def run_snapshot():
             row = [f"↑ +{pct}%", f"${target:,.0f}"]
             for d in day_targets:
                 prob = barrier_probability(spot, target, d, sigma)
-                row.append(f"{prob*100:.1f}%" if prob > 0.01 else f"{prob*100:.2f}%")
+                if prob > 0.80:
+                    row.append(f"[bold white on dark_green] {prob*100:.0f}% [/bold white on dark_green]")
+                elif prob > 0.60:
+                    row.append(f"[bold green]{prob*100:.0f}%[/bold green]")
+                elif prob > 0.01:
+                    row.append(f"{prob*100:.1f}%")
+                else:
+                    row.append(f"[dim]{prob*100:.2f}%[/dim]")
             table.add_row(*row)
 
         table.add_section()
@@ -376,11 +412,57 @@ async def run_snapshot():
             row = [f"↓ -{pct}%", f"${target:,.0f}"]
             for d in day_targets:
                 prob = barrier_probability(spot, target, d, sigma)
-                row.append(f"{prob*100:.1f}%" if prob > 0.01 else f"{prob*100:.2f}%")
+                if prob > 0.80:
+                    row.append(f"[bold white on dark_red] {prob*100:.0f}% [/bold white on dark_red]")
+                elif prob > 0.60:
+                    row.append(f"[bold red]{prob*100:.0f}%[/bold red]")
+                elif prob > 0.01:
+                    row.append(f"{prob*100:.1f}%")
+                else:
+                    row.append(f"[dim]{prob*100:.2f}%[/dim]")
             table.add_row(*row)
 
         console.print(table)
         console.print()
+
+        # ── TRADE SIGNALS ──────────────────────────────────────────
+        signal_rows = []
+        for label, targets, side in [
+            ("LONG", [5, 10, 15, 20, 30, 50], "up"),
+            ("SHORT", [5, 10, 15, 20, 30, 40], "down"),
+        ]:
+            for pct in targets:
+                target = spot * (1 + pct / 100) if side == "up" else spot * (1 - pct / 100)
+                for d in [1, 3, 7, 14, 30]:
+                    prob = barrier_probability(spot, target, d, sigma)
+                    if prob > 0.80:
+                        signal_rows.append((side, pct, d, prob, "🔥 STRONG", "bold white on dark_green" if side == "up" else "bold white on dark_red"))
+                    elif prob > 0.60:
+                        signal_rows.append((side, pct, d, prob, "📈 LONG" if side == "up" else "📉 SHORT", "bold green" if side == "up" else "bold red"))
+
+        if signal_rows:
+            console.print(f"[bold]🎯 TRADE SIGNALS (σ={sigma*100:.0f}%):[/bold]\n")
+            sig_table = Table(box=box.SIMPLE, show_header=True, header_style="bold white")
+            sig_table.add_column("Dir", width=6)
+            sig_table.add_column("Move", width=6)
+            sig_table.add_column("In", width=4)
+            sig_table.add_column("Prob", justify="right", width=6)
+            sig_table.add_column("Signal", width=16)
+
+            for side, pct, d, prob, label, style in signal_rows[:12]:
+                dir_str = "LONG" if side == "up" else "SHORT"
+                move_str = f"+{pct}%" if side == "up" else f"-{pct}%"
+                sig_table.add_row(
+                    f"[cyan]{dir_str}[/cyan]" if side == "up" else f"[magenta]{dir_str}[/magenta]",
+                    move_str, f"{d}d", f"[bold]{prob*100:.0f}%[/bold]",
+                    f"[{style}]{label}[/{style}]",
+                )
+
+            console.print(sig_table)
+            console.print()
+        else:
+            console.print("[dim]No high-conviction trade signals (all probabilities < 60%)[/dim]")
+            console.print()
 
         # Vol cone
         console.print(f"[bold]Volatility:[/bold]")
